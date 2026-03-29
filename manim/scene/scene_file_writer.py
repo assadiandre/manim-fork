@@ -5,6 +5,7 @@ from __future__ import annotations
 __all__ = ["SceneFileWriter"]
 
 import json
+import math
 import shutil
 import warnings
 from fractions import Fraction
@@ -531,11 +532,107 @@ class SceneFileWriter:
                 self.flush_cache_directory()
             else:
                 self.clean_cache()
+            self.generate_frame_sheet()
         elif is_png_format() and not config["dry_run"]:
             target_dir = self.image_file_path.parent / self.image_file_path.stem
             logger.info("\n%i images ready at %s\n", self.frame_count, str(target_dir))
         if self.subcaptions:
             self.write_subcaption_file()
+
+    @staticmethod
+    def _is_blank_frame(img: Image.Image, pixel_threshold: int = 30,
+                        coverage: float = 0.995) -> bool:
+        """Return True if virtually all pixels are near-black.
+
+        The default threshold of 30 accommodates typical dark backgrounds
+        (e.g. ``#0d1117``).
+        """
+        arr = np.asarray(img.convert("RGB"))
+        return (np.all(arr < pixel_threshold, axis=-1)).mean() >= coverage
+
+    @staticmethod
+    def _frame_difference(a: Image.Image, b: Image.Image) -> float:
+        """Return normalised mean absolute difference between two images (0-1)."""
+        arr_a = np.asarray(a.convert("RGB")).astype(np.float32)
+        arr_b = np.asarray(b.convert("RGB")).astype(np.float32)
+        return float(np.abs(arr_a - arr_b).mean() / 255.0)
+
+    def generate_frame_sheet(self) -> None:
+        """Export settled-state frames as individual images, sorted into scene folders.
+
+        Each ``self.play()`` / ``self.wait()`` produces a partial movie file.
+        The last frame of each is the settled state.  Consecutive settled
+        frames that are visually similar are grouped into the same folder;
+        a large visual change starts a new folder.  Blank frames are omitted.
+        """
+        movie_path = self.gif_file_path if is_gif_format() else self.movie_file_path
+        if not movie_path.exists():
+            return
+
+        THUMB_SIZE = (540, 540)
+        SCENE_CHANGE_THRESHOLD = 0.06
+
+        partial_files = [p for p in self.partial_movie_files if p is not None]
+        if not partial_files:
+            return
+
+        frames: list[Image.Image] = []
+        for pf in partial_files:
+            try:
+                container = av.open(pf)
+                last_frame = None
+                for frame in container.decode(video=0):
+                    last_frame = frame
+                if last_frame is not None:
+                    img = last_frame.to_image()
+                    img.thumbnail(THUMB_SIZE, Image.LANCZOS)
+                    frames.append(img)
+                container.close()
+            except Exception:
+                continue
+
+        if not frames:
+            return
+
+        groups: list[list[Image.Image]] = []
+        current_group: list[Image.Image] = []
+
+        for img in frames:
+            if self._is_blank_frame(img):
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                continue
+
+            if current_group and self._frame_difference(current_group[-1], img) > SCENE_CHANGE_THRESHOLD:
+                groups.append(current_group)
+                current_group = []
+
+            current_group.append(img)
+
+        if current_group:
+            groups.append(current_group)
+
+        if not groups:
+            return
+
+        frames_dir = movie_path.parent / f"{movie_path.stem}_frames"
+        frames_dir.mkdir(exist_ok=True)
+
+        total = 0
+        for group_idx, group in enumerate(groups):
+            group_dir = frames_dir / f"scene_{group_idx + 1}"
+            group_dir.mkdir(exist_ok=True)
+
+            for idx, img in enumerate(group):
+                img.save(group_dir / f"settled_{idx:04d}.png")
+                total += 1
+
+        logger.info(
+            "%(total)d settled-state frames exported to %(path)s "
+            "(%(groups)d scene folders)",
+            {"total": total, "path": f"'{frames_dir}'", "groups": len(groups)},
+        )
 
     def open_partial_movie_stream(self, file_path: StrPath | None = None) -> None:
         """Open a container holding a video stream.
