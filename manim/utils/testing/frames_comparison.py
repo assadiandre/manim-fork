@@ -6,7 +6,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import cairo
 import pytest
 from _pytest.fixtures import FixtureRequest
 
@@ -30,7 +29,6 @@ from ._test_class_makers import (
 SCENE_PARAMETER_NAME = "scene"
 _tests_root_dir_path = Path(__file__).absolute().parents[2]
 PATH_CONTROL_DATA = _tests_root_dir_path / Path("control_data", "graphical_units_data")
-MIN_CAIRO_VERSION = 11800
 
 
 def frames_comparison(
@@ -90,12 +88,6 @@ def frames_comparison(
         def wrapper(
             *args: Any, request: FixtureRequest, tmp_path: StrPath, **kwargs: Any
         ) -> None:
-            # check for cairo version
-            if (
-                renderer_class is CairoRenderer
-                and cairo.cairo_version() < MIN_CAIRO_VERSION
-            ):
-                pytest.skip("Cairo version is too old. Skipping cairo graphical tests.")
             # Wraps the test_function to a construct method, to "freeze" the eventual additional arguments (parametrizations fixtures).
             construct = functools.partial(tested_scene_construct, *args, **kwargs)
 

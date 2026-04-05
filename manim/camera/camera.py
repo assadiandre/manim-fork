@@ -12,9 +12,10 @@ from collections.abc import Callable, Iterable
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Self
 
-import cairo
 import numpy as np
+import skia
 from PIL import Image
+
 
 from manim._config import config, logger
 from manim.constants import *
@@ -44,17 +45,17 @@ if TYPE_CHECKING:
 
 LINE_JOIN_MAP = {
     LineJointType.AUTO: None,  # TODO: this could be improved
-    LineJointType.ROUND: cairo.LineJoin.ROUND,
-    LineJointType.BEVEL: cairo.LineJoin.BEVEL,
-    LineJointType.MITER: cairo.LineJoin.MITER,
+    LineJointType.ROUND: skia.Paint.kRound_Join,
+    LineJointType.BEVEL: skia.Paint.kBevel_Join,
+    LineJointType.MITER: skia.Paint.kMiter_Join,
 }
 
 
 CAP_STYLE_MAP = {
     CapStyleType.AUTO: None,  # TODO: this could be improved
-    CapStyleType.ROUND: cairo.LineCap.ROUND,
-    CapStyleType.BUTT: cairo.LineCap.BUTT,
-    CapStyleType.SQUARE: cairo.LineCap.SQUARE,
+    CapStyleType.ROUND: skia.Paint.kRound_Cap,
+    CapStyleType.BUTT: skia.Paint.kButt_Cap,
+    CapStyleType.SQUARE: skia.Paint.kSquare_Cap,
 }
 
 
@@ -147,7 +148,7 @@ class Camera:
         self.max_allowable_norm = config["frame_width"]
 
         self.rgb_max_val = np.iinfo(self.pixel_array_dtype).max
-        self.pixel_array_to_cairo_context: dict[int, cairo.Context] = {}
+        self.pixel_array_to_cairo_context: dict[int, tuple] = {}
 
         # Contains the correct method to process a list of Mobjects of the
         # corresponding class.  If a Mobject is not an instance of a class in
@@ -560,8 +561,8 @@ class Camera:
     # NOTE: None of the methods below have been mentioned outside of their definitions. Their DocStrings are not as
     # detailed as possible.
 
-    def get_cached_cairo_context(self, pixel_array: PixelArray) -> cairo.Context | None:
-        """Returns the cached cairo context of the passed
+    def get_cached_cairo_context(self, pixel_array: PixelArray) -> tuple | None:
+        """Returns the cached skia canvas/surface tuple for the passed
         pixel array if it exists, and None if it doesn't.
 
         Parameters
@@ -571,67 +572,66 @@ class Camera:
 
         Returns
         -------
-        cairo.Context
-            The cached cairo context.
+        tuple
+            The cached (canvas, surface) tuple.
         """
         return self.pixel_array_to_cairo_context.get(id(pixel_array), None)
 
-    def cache_cairo_context(self, pixel_array: PixelArray, ctx: cairo.Context) -> None:
-        """Caches the passed Pixel array into a Cairo Context
+    def cache_cairo_context(self, pixel_array: PixelArray, ctx: tuple) -> None:
+        """Caches the passed pixel array's rendering context.
 
         Parameters
         ----------
         pixel_array
             The pixel array to cache
         ctx
-            The context to cache it into.
+            The (canvas, surface) tuple to cache.
         """
         self.pixel_array_to_cairo_context[id(pixel_array)] = ctx
 
-    def get_cairo_context(self, pixel_array: PixelArray) -> cairo.Context:
-        """Returns the cairo context for a pixel array after
-        caching it to self.pixel_array_to_cairo_context
-        If that array has already been cached, it returns the
-        cached version instead.
+    def get_skia_canvas(self, pixel_array: PixelArray) -> tuple:
+        """Returns a (canvas, surface) tuple for a pixel array after
+        caching it. If that array has already been cached, it returns
+        the cached version instead.
 
         Parameters
         ----------
         pixel_array
-            The Pixel array to get the cairo context of.
+            The pixel array to get the skia canvas for.
 
         Returns
         -------
-        cairo.Context
-            The cairo context of the pixel array.
+        tuple
+            The (canvas, surface) tuple.
         """
-        cached_ctx = self.get_cached_cairo_context(pixel_array)
-        if cached_ctx:
-            return cached_ctx
+        cached = self.get_cached_cairo_context(pixel_array)
+        if cached:
+            return cached
+
         pw = self.pixel_width
         ph = self.pixel_height
         fw = self.frame_width
         fh = self.frame_height
         fc = self.frame_center
-        surface = cairo.ImageSurface.create_for_data(
-            pixel_array.data,
-            cairo.FORMAT_ARGB32,
-            pw,
-            ph,
+
+        info = skia.ImageInfo.Make(
+            pw, ph, skia.kRGBA_8888_ColorType, skia.kUnpremul_AlphaType
         )
-        ctx = cairo.Context(surface)
-        ctx.scale(pw, ph)
-        ctx.set_matrix(
-            cairo.Matrix(
-                (pw / fw),
-                0,
-                0,
-                -(ph / fh),
-                (pw / 2) - fc[0] * (pw / fw),
-                (ph / 2) + fc[1] * (ph / fh),
-            ),
+        surface = skia.Surface.MakeRasterDirect(info, pixel_array.data, pw * 4)
+        canvas = surface.getCanvas()
+        canvas.translate(
+            (pw / 2) - fc[0] * (pw / fw),
+            (ph / 2) + fc[1] * (ph / fh),
         )
-        self.cache_cairo_context(pixel_array, ctx)
-        return ctx
+        canvas.scale(pw / fw, -(ph / fh))
+
+        result = (canvas, surface)
+        self.cache_cairo_context(pixel_array, result)
+        return result
+
+    def get_cairo_context(self, pixel_array: PixelArray) -> tuple:
+        """Backwards-compatible alias for get_skia_canvas."""
+        return self.get_skia_canvas(pixel_array)
 
     def display_multiple_vectorized_mobjects(
         self, vmobjects: list[VMobject], pixel_array: PixelArray
@@ -670,105 +670,106 @@ class Camera:
         pixel_array
             The Pixel array to add the VMobjects to.
         """
-        ctx = self.get_cairo_context(pixel_array)
+        ctx = self.get_skia_canvas(pixel_array)
         for vmobject in vmobjects:
             self.display_vectorized(vmobject, ctx)
 
-    def display_vectorized(self, vmobject: VMobject, ctx: cairo.Context) -> Self:
-        """Displays a VMobject in the cairo context
+    def display_vectorized(self, vmobject: VMobject, ctx) -> Self:
+        """Displays a VMobject in the skia canvas.
 
         Parameters
         ----------
         vmobject
             The Vectorized Mobject to display
         ctx
-            The cairo context to use.
+            The (canvas, surface) tuple to use.
 
         Returns
         -------
         Camera
             The camera object
         """
-        self.set_cairo_context_path(ctx, vmobject)
-        self.apply_stroke(ctx, vmobject, background=True)
-        self.apply_fill(ctx, vmobject)
-        self.apply_stroke(ctx, vmobject)
+        canvas, surface = ctx
+        sk_path = self._build_skia_path(vmobject)
+        if sk_path is None:
+            return self
+        self.apply_stroke(canvas, sk_path, vmobject, background=True)
+        self.apply_fill(canvas, sk_path, vmobject)
+        self.apply_stroke(canvas, sk_path, vmobject)
         return self
 
-    def set_cairo_context_path(self, ctx: cairo.Context, vmobject: VMobject) -> Self:
-        """Sets a path for the cairo context with the vmobject passed
+    def _build_skia_path(self, vmobject: VMobject) -> skia.Path | None:
+        """Builds a skia.Path from a VMobject's points.
 
         Parameters
         ----------
-        ctx
-            The cairo context
         vmobject
             The VMobject
 
         Returns
         -------
-        Camera
-            Camera object after setting cairo_context_path
+        skia.Path or None
+            The constructed path, or None if the vmobject has no points.
         """
         points = self.transform_points_pre_display(vmobject, vmobject.points)
-        # TODO, shouldn't this be handled in transform_points_pre_display?
-        # points = points - self.get_frame_center()
         if len(points) == 0:
-            return self
+            return None
 
-        ctx.new_path()
+        sk_path = skia.Path()
         subpaths = vmobject.gen_subpaths_from_points_2d(points)
         for subpath in subpaths:
             quads = vmobject.gen_cubic_bezier_tuples_from_points(subpath)
-            ctx.new_sub_path()
             start = subpath[0]
-            ctx.move_to(*start[:2])
+            sk_path.moveTo(float(start[0]), float(start[1]))
             for _p0, p1, p2, p3 in quads:
-                ctx.curve_to(*p1[:2], *p2[:2], *p3[:2])
+                sk_path.cubicTo(
+                    float(p1[0]), float(p1[1]),
+                    float(p2[0]), float(p2[1]),
+                    float(p3[0]), float(p3[1]),
+                )
             if vmobject.consider_points_equals_2d(subpath[0], subpath[-1]):
-                ctx.close_path()
-        return self
+                sk_path.close()
+        return sk_path
 
-    def set_cairo_context_color(
-        self, ctx: cairo.Context, rgbas: FloatRGBALike_Array, vmobject: VMobject
-    ) -> Self:
-        """Sets the color of the cairo context
+    def _set_skia_paint_color(
+        self, paint: skia.Paint, rgbas: FloatRGBALike_Array, vmobject: VMobject
+    ) -> None:
+        """Sets the color or gradient shader on a skia Paint.
 
         Parameters
         ----------
-        ctx
-            The cairo context
+        paint
+            The skia paint to configure.
         rgbas
-            The RGBA array with which to color the context.
+            The RGBA array with which to color the paint.
         vmobject
-            The VMobject with which to set the color.
-
-        Returns
-        -------
-        Camera
-            The camera object
+            The VMobject (used for gradient endpoints).
         """
         if len(rgbas) == 1:
-            # Use reversed rgb because cairo surface is
-            # encodes it in reverse order
-            ctx.set_source_rgba(*rgbas[0][2::-1], rgbas[0][3])
+            r, g, b, a = rgbas[0]
+            paint.setColor4f(skia.Color4f(float(r), float(g), float(b), float(a)))
         else:
             points = vmobject.get_gradient_start_and_end_points()
             points = self.transform_points_pre_display(vmobject, points)
-            pat = cairo.LinearGradient(*it.chain(*(point[:2] for point in points)))
-            offsets = np.linspace(0, 1, len(rgbas))
-            for rgba, offset in zip(rgbas, offsets, strict=True):
-                pat.add_color_stop_rgba(offset, *rgba[2::-1], rgba[3])
-            ctx.set_source(pat)
-        return self
+            p0 = skia.Point(float(points[0][0]), float(points[0][1]))
+            p1 = skia.Point(float(points[1][0]), float(points[1][1]))
+            colors = [
+                skia.Color4f(float(c[0]), float(c[1]), float(c[2]), float(c[3]))
+                for c in rgbas
+            ]
+            positions = [i / (len(rgbas) - 1) for i in range(len(rgbas))]
+            shader = skia.GradientShader.MakeLinear([p0, p1], colors, positions)
+            paint.setShader(shader)
 
-    def apply_fill(self, ctx: cairo.Context, vmobject: VMobject) -> Self:
-        """Fills the cairo context
+    def apply_fill(self, canvas, sk_path, vmobject: VMobject) -> Self:
+        """Fills the skia path on the canvas.
 
         Parameters
         ----------
-        ctx
-            The cairo context
+        canvas
+            The skia canvas
+        sk_path
+            The skia path
         vmobject
             The VMobject
 
@@ -777,19 +778,28 @@ class Camera:
         Camera
             The camera object.
         """
-        self.set_cairo_context_color(ctx, self.get_fill_rgbas(vmobject), vmobject)
-        ctx.fill_preserve()
+        fill_rgbas = self.get_fill_rgbas(vmobject)
+        if len(fill_rgbas) == 0 or all(c[3] == 0 for c in fill_rgbas):
+            return self
+
+        paint = skia.Paint()
+        paint.setAntiAlias(True)
+        paint.setStyle(skia.Paint.kFill_Style)
+        self._set_skia_paint_color(paint, fill_rgbas, vmobject)
+        canvas.drawPath(sk_path, paint)
         return self
 
     def apply_stroke(
-        self, ctx: cairo.Context, vmobject: VMobject, background: bool = False
+        self, canvas, sk_path, vmobject: VMobject, background: bool = False
     ) -> Self:
-        """Applies a stroke to the VMobject in the cairo context.
+        """Applies a stroke to the VMobject path on the skia canvas.
 
         Parameters
         ----------
-        ctx
-            The cairo context
+        canvas
+            The skia canvas
+        sk_path
+            The skia path
         vmobject
             The VMobject
         background
@@ -804,22 +814,23 @@ class Camera:
         width = vmobject.get_stroke_width(background)
         if width == 0:
             return self
-        self.set_cairo_context_color(
-            ctx,
-            self.get_stroke_rgbas(vmobject, background=background),
-            vmobject,
-        )
-        ctx.set_line_width(
-            width
-            * self.cairo_line_width_multiple
-            * (self.frame_width / self.frame_width),
-            # This ensures lines have constant width as you zoom in on them.
-        )
+
+        stroke_rgbas = self.get_stroke_rgbas(vmobject, background=background)
+        if len(stroke_rgbas) == 0 or all(c[3] == 0 for c in stroke_rgbas):
+            return self
+
+        paint = skia.Paint()
+        paint.setAntiAlias(True)
+        paint.setStyle(skia.Paint.kStroke_Style)
+        paint.setStrokeWidth(float(width) * self.cairo_line_width_multiple)
+
         if vmobject.joint_type != LineJointType.AUTO:
-            ctx.set_line_join(LINE_JOIN_MAP[vmobject.joint_type])
+            paint.setStrokeJoin(LINE_JOIN_MAP[vmobject.joint_type])
         if vmobject.cap_style != CapStyleType.AUTO:
-            ctx.set_line_cap(CAP_STYLE_MAP[vmobject.cap_style])
-        ctx.stroke_preserve()
+            paint.setStrokeCap(CAP_STYLE_MAP[vmobject.cap_style])
+
+        self._set_skia_paint_color(paint, stroke_rgbas, vmobject)
+        canvas.drawPath(sk_path, paint)
         return self
 
     def get_stroke_rgbas(
