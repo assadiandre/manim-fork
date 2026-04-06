@@ -618,6 +618,7 @@ class Camera:
             pw, ph, skia.kRGBA_8888_ColorType, skia.kUnpremul_AlphaType
         )
         surface = skia.Surface.MakeRasterDirect(info, pixel_array.data, pw * 4)
+
         canvas = surface.getCanvas()
         canvas.translate(
             (pw / 2) - fc[0] * (pw / fw),
